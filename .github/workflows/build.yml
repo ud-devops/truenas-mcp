@@ -41,6 +41,9 @@ jobs:
     - name: Run tests
       run: make test
 
+    - name: Run tests with the race detector
+      run: make test-race
+
     - name: Run tests with coverage
       run: go test -coverprofile=coverage.out -covermode=atomic ./...
 

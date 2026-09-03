@@ -1,0 +1,12 @@
+# Normalise line endings so a Windows checkout does not fail the gofmt
+# check in CI (Go source is always LF in the repository).
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+Makefile text eol=lf
+
+*.png binary
+*.jpg binary

@@ -1,10 +1,13 @@
 package truenas
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/truenas/truenas-mcp/redact"
 )
 
 // debugLogging controls whether full request/response bodies are written to
@@ -53,6 +57,32 @@ type Client struct {
 	pending   map[string]chan *responseResult
 
 	requestID atomic.Uint64
+
+	// timeout bounds how long a single middleware call may take. Stored
+	// atomically so it can be tuned without racing in-flight calls.
+	timeout atomic.Int64
+}
+
+// DefaultRequestTimeout is how long a middleware call may run before the
+// client gives up on it.
+const DefaultRequestTimeout = 120 * time.Second
+
+// SetRequestTimeout overrides the per-call timeout. A non-positive value
+// restores the default. Some operations (a pool scrub summary on a large
+// array, an app catalog refresh) legitimately exceed two minutes, so this is
+// exposed rather than hard-coded.
+func (c *Client) SetRequestTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultRequestTimeout
+	}
+	c.timeout.Store(int64(d))
+}
+
+func (c *Client) requestTimeout() time.Duration {
+	if d := c.timeout.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return DefaultRequestTimeout
 }
 
 type responseResult struct {
@@ -244,29 +274,93 @@ func (c *Client) failAllPending(err error) {
 	}
 }
 
-// buildConnectionURLs returns URLs to try in order
+// DefaultWebSocketPath is the TrueNAS middleware endpoint for the legacy
+// DDP-style protocol this client speaks.
+const DefaultWebSocketPath = "/websocket"
+
+// buildConnectionURLs returns URLs to try in order.
+//
+// The endpoint may be a bare hostname ("truenas.local"), a host with a port
+// ("truenas.local:8443"), a bracketed or bare IPv6 literal ("[fd00::1]:443",
+// "fd00::1"), or a full wss:// / https:// URL.
 func (c *Client) buildConnectionURLs() ([]string, error) {
-	// SECURITY: Reject ws:// URLs entirely - TrueNAS will revoke API keys used over unencrypted connections
-	if strings.HasPrefix(c.endpoint, "ws://") {
-		return nil, fmt.Errorf("SECURITY ERROR: ws:// (unencrypted) connections are not allowed. TrueNAS will revoke API keys used over ws://. Use wss:// instead")
+	endpoint := strings.TrimSpace(c.endpoint)
+	if endpoint == "" {
+		return nil, fmt.Errorf("endpoint cannot be empty")
 	}
 
-	// If full wss:// URL provided, use it
-	if strings.HasPrefix(c.endpoint, "wss://") {
-		return []string{c.endpoint}, nil
+	// SECURITY: Reject unencrypted schemes entirely - TrueNAS revokes API keys
+	// used over ws://.
+	if strings.HasPrefix(endpoint, "ws://") || strings.HasPrefix(endpoint, "http://") {
+		return nil, fmt.Errorf("SECURITY ERROR: unencrypted connections are not allowed. TrueNAS will revoke API keys used over ws://. Use wss:// instead")
 	}
 
-	// Otherwise, ONLY use wss:// (secure connection required for API key authentication)
-	hostname := c.endpoint
-	// Remove port if specified (we'll add the correct port)
-	if idx := strings.LastIndex(hostname, ":"); idx != -1 {
-		hostname = hostname[:idx]
+	if strings.HasPrefix(endpoint, "wss://") || strings.HasPrefix(endpoint, "https://") {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("invalid endpoint URL %q: %w", endpoint, err)
+		}
+		u.Scheme = "wss"
+		if u.Path == "" || u.Path == "/" {
+			u.Path = DefaultWebSocketPath
+		}
+		return []string{u.String()}, nil
 	}
 
-	return []string{fmt.Sprintf("wss://%s:443/websocket", hostname)}, nil
+	host, port, err := splitHostPort(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	u := url.URL{Scheme: "wss", Host: net.JoinHostPort(host, port), Path: DefaultWebSocketPath}
+	return []string{u.String()}, nil
+}
+
+// splitHostPort separates an optional port from a host, defaulting to 443.
+//
+// A naive strings.LastIndex(":") is wrong twice over: it silently discards a
+// port the user deliberately chose (TrueNAS behind a reverse proxy on 8443
+// became unreachable), and it truncates a bare IPv6 literal such as "fd00::1"
+// to "fd00:".
+func splitHostPort(endpoint string) (host, port string, err error) {
+	const defaultPort = "443"
+
+	if strings.HasPrefix(endpoint, "[") {
+		// Bracketed IPv6, with or without a port.
+		if h, p, e := net.SplitHostPort(endpoint); e == nil {
+			return h, p, nil
+		}
+		trimmed := strings.TrimSuffix(strings.TrimPrefix(endpoint, "["), "]")
+		if net.ParseIP(trimmed) == nil {
+			return "", "", fmt.Errorf("invalid IPv6 endpoint %q", endpoint)
+		}
+		return trimmed, defaultPort, nil
+	}
+
+	// A bare IPv6 literal has more than one colon and no brackets, so it can
+	// never be a host:port pair.
+	if strings.Count(endpoint, ":") > 1 {
+		if net.ParseIP(endpoint) == nil {
+			return "", "", fmt.Errorf("invalid endpoint %q: bare IPv6 addresses with a port must be bracketed, e.g. [fd00::1]:443", endpoint)
+		}
+		return endpoint, defaultPort, nil
+	}
+
+	if h, p, e := net.SplitHostPort(endpoint); e == nil {
+		if h == "" {
+			return "", "", fmt.Errorf("invalid endpoint %q: missing host", endpoint)
+		}
+		return h, p, nil
+	}
+	return endpoint, defaultPort, nil
 }
 
 func (c *Client) Authenticate() error {
+	return c.AuthenticateContext(context.Background())
+}
+
+// AuthenticateContext logs in, honouring ctx for cancellation.
+func (c *Client) AuthenticateContext(ctx context.Context) error {
 	// Ensure connected before authenticating
 	c.connMu.Lock()
 	err := c.connect()
@@ -278,7 +372,7 @@ func (c *Client) Authenticate() error {
 	log.Println("Authenticating with TrueNAS middleware...")
 
 	// Call auth.login_with_api_key
-	result, err := c.callRaw("auth.login_with_api_key", c.apiKey)
+	result, err := c.callRaw(ctx, "auth.login_with_api_key", c.apiKey)
 	if err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
@@ -300,7 +394,21 @@ func (c *Client) Authenticate() error {
 	return nil
 }
 
+// Call invokes a middleware method with the client's default timeout.
 func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, error) {
+	return c.CallContext(context.Background(), method, params...)
+}
+
+// CallContext invokes a middleware method, aborting when ctx is cancelled.
+//
+// Cancellation matters here because a tool call the user abandoned would
+// otherwise hold its slot for the full request timeout while the middleware
+// keeps working on it.
+func (c *Client) CallContext(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Ensure connected and authenticated (serialized to prevent concurrent reconnects)
 	c.connMu.Lock()
 	if err := c.connect(); err != nil {
@@ -311,67 +419,22 @@ func (c *Client) Call(method string, params ...interface{}) (json.RawMessage, er
 	c.connMu.Unlock()
 
 	if needsAuth {
-		if err := c.Authenticate(); err != nil {
+		if err := c.AuthenticateContext(ctx); err != nil {
 			return nil, fmt.Errorf("re-authentication failed: %w", err)
 		}
 	}
 
-	return c.callRaw(method, params...)
-}
-
-// sensitiveKeyFragments match JSON object keys whose values must never be
-// written to logs or error messages (e.g. bindpw in directoryservices.update).
-var sensitiveKeyFragments = []string{"password", "passwd", "bindpw", "secret", "api_key", "apikey", "token", "credential"}
-
-func isSensitiveKey(key string) bool {
-	k := strings.ToLower(key)
-	for _, fragment := range sensitiveKeyFragments {
-		if strings.Contains(k, fragment) {
-			return true
-		}
-	}
-	return false
+	return c.callRaw(ctx, method, params...)
 }
 
 // redactValue returns a deep copy of v with values under sensitive keys masked.
-func redactValue(v interface{}) interface{} {
-	switch t := v.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(t))
-		for k, val := range t {
-			if isSensitiveKey(k) {
-				out[k] = "[REDACTED]"
-			} else {
-				out[k] = redactValue(val)
-			}
-		}
-		return out
-	case []interface{}:
-		out := make([]interface{}, len(t))
-		for i, val := range t {
-			out[i] = redactValue(val)
-		}
-		return out
-	default:
-		return v
-	}
-}
+func redactValue(v interface{}) interface{} { return redact.Value(v) }
 
 // RedactJSONForLog returns raw with values under credential-bearing keys
 // (password, bindpw, secret, ...) replaced by "[REDACTED]". Intended for
 // sanitizing JSON messages before writing them to logs. Returns raw unchanged
 // if it is not valid JSON.
-func RedactJSONForLog(raw []byte) []byte {
-	var v interface{}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return raw
-	}
-	out, err := json.Marshal(redactValue(v))
-	if err != nil {
-		return raw
-	}
-	return out
-}
+func RedactJSONForLog(raw []byte) []byte { return redact.JSON(raw) }
 
 // scrubSecrets removes the client's API key from server-supplied text (error
 // messages, traces, response bodies) in case the server echoes it back.
@@ -403,11 +466,15 @@ func redactParams(method string, params []interface{}) []interface{} {
 
 // callRaw sends a request and waits for its response via the pending map.
 // Safe for concurrent use.
-func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage, error) {
+func (c *Client) callRaw(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
 	var lastErr error
 
 	// Try up to 2 times (initial attempt + 1 retry on connection error)
 	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		if attempt > 0 {
 			log.Printf("Retrying request after connection error (attempt %d/2)...", attempt+1)
 			c.connMu.Lock()
@@ -416,7 +483,7 @@ func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage,
 				return nil, fmt.Errorf("reconnection failed: %w", err)
 			}
 			c.connMu.Unlock()
-			if err := c.Authenticate(); err != nil {
+			if err := c.AuthenticateContext(ctx); err != nil {
 				return nil, fmt.Errorf("re-authentication failed: %w", err)
 			}
 		}
@@ -436,7 +503,7 @@ func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage,
 					return nil, fmt.Errorf("reconnection failed: %w", err)
 				}
 				c.connMu.Unlock()
-				if err := c.Authenticate(); err != nil {
+				if err := c.AuthenticateContext(ctx); err != nil {
 					return nil, fmt.Errorf("re-authentication failed: %w", err)
 				}
 				continue
@@ -521,12 +588,20 @@ func (c *Client) callRaw(method string, params ...interface{}) (json.RawMessage,
 
 			return resp.Result, nil
 
-		case <-time.After(120 * time.Second):
+		case <-ctx.Done():
+			// The caller gave up (client cancellation, shutdown). Drop the
+			// pending entry so the read loop does not log an orphan response.
+			c.pendingMu.Lock()
+			delete(c.pending, id)
+			c.pendingMu.Unlock()
+			return nil, fmt.Errorf("request cancelled (method: %s): %w", method, ctx.Err())
+
+		case <-time.After(c.requestTimeout()):
 			// Timeout - clean up pending entry
 			c.pendingMu.Lock()
 			delete(c.pending, id)
 			c.pendingMu.Unlock()
-			return nil, fmt.Errorf("request timed out after 120 seconds (method: %s)", method)
+			return nil, fmt.Errorf("request timed out after %s (method: %s)", c.requestTimeout(), method)
 		}
 	}
 

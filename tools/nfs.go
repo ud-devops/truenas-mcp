@@ -11,7 +11,7 @@ import (
 )
 
 // handleCreateNFSShare creates a new NFS share
-func handleCreateNFSShare(client *truenas.Client, args map[string]interface{}) (string, error) {
+func handleCreateNFSShare(ctx context.Context, client *truenas.Client, args map[string]interface{}) (string, error) {
 	// Extract required parameter
 	path, ok := args["path"].(string)
 	if !ok || path == "" {
@@ -134,7 +134,7 @@ func handleCreateNFSShare(client *truenas.Client, args map[string]interface{}) (
 	}
 
 	// Call the API
-	result, err := client.Call("sharing.nfs.create", payload)
+	result, err := client.CallContext(ctx, "sharing.nfs.create", payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to create NFS share: %w", err)
 	}

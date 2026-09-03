@@ -1,28 +1,36 @@
 {
   "mcpServers": {
-    "truenas-local": {
-      "comment": "Direct SSE connection (local TrueNAS only)",
-      "url": "http://localhost:8080/sse",
-      "headers": {
-        "Authorization": "Bearer your-secure-api-key-here"
-      }
-    },
-    "truenas-remote": {
-      "comment": "Proxy method (recommended for remote TrueNAS)",
-      "command": "truenas-mcp-proxy",
+    "truenas-readonly": {
+      "comment": "Recommended starting point: stdio, certificate verified, no tool can change the system.",
+      "command": "/usr/local/bin/truenas-mcp",
       "args": [
-        "--server-url", "http://192.168.0.31:8089",
-        "--api-key", "your-secure-key-here"
-      ]
-    },
-    "truenas-remote-secure": {
-      "comment": "Proxy with environment variable for API key (more secure)",
-      "command": "truenas-mcp-proxy",
-      "args": [
-        "--server-url", "http://192.168.0.31:8089"
+        "--truenas-url", "truenas.local",
+        "--tls-ca", "/etc/ssl/certs/truenas.pem",
+        "--read-only"
       ],
       "env": {
-        "TRUENAS_MCP_API_KEY": "your-secure-key-here"
+        "TRUENAS_API_KEY": "REPLACE_WITH_YOUR_TRUENAS_API_KEY"
+      }
+    },
+
+    "truenas-full": {
+      "comment": "Full tool surface with the most dangerous operations denied. Remove --deny-tools once you trust the setup.",
+      "command": "/usr/local/bin/truenas-mcp",
+      "args": [
+        "--truenas-url", "truenas.local:8443",
+        "--tls-ca", "/etc/ssl/certs/truenas.pem",
+        "--deny-tools", "system_reboot,apply_update,delete_boot_environment,rollback_snapshot"
+      ],
+      "env": {
+        "TRUENAS_API_KEY": "REPLACE_WITH_YOUR_TRUENAS_API_KEY"
+      }
+    },
+
+    "truenas-http": {
+      "comment": "Streamable HTTP transport, for clients that cannot spawn a subprocess. Start the server with: truenas-mcp --truenas-url truenas.local --http-addr 127.0.0.1:8089",
+      "url": "http://127.0.0.1:8089/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_HTTP_TOKEN"
       }
     }
   }

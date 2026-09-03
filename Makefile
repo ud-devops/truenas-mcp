@@ -1,4 +1,4 @@
-.PHONY: build build-all clean test lint
+.PHONY: build build-all clean test test-race lint fmt
 
 BINARY_NAME=truenas-mcp
 BUILD_DIR=.
@@ -33,9 +33,28 @@ clean:
 
 test:
 	@echo "Running tests..."
-	go test -v ./...
+	go test ./...
 
+# The race detector is where the concurrent request dispatch and the client's
+# response multiplexing actually get proven; plain `go test` cannot see those
+# bugs. Needs cgo, so it is a separate target.
+test-race:
+	@echo "Running tests with the race detector..."
+	CGO_ENABLED=1 go test -race ./...
+
+# `go fmt` rewrites files and always exits 0, so it could never fail CI on
+# formatting drift. `gofmt -l` reports offenders instead.
 lint:
 	@echo "Running linters..."
 	go vet ./...
-	go fmt ./...
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "These files are not gofmt-formatted:"; \
+		echo "$$unformatted"; \
+		echo "Run: make fmt"; \
+		exit 1; \
+	fi
+
+fmt:
+	@echo "Formatting..."
+	gofmt -w .

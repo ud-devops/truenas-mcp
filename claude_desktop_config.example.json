@@ -4,8 +4,12 @@
       "command": "/usr/local/bin/truenas-mcp",
       "args": [
         "--truenas-url", "192.168.0.31",
-        "--api-key", "19-ZLHNjv0Hu0l8VwB9pXYQldIg2uCoLZzRaNhMyrZ47iYl1pE8RBvIBXs2N5Zdizsw"
-      ]
+        "--tls-ca", "/etc/ssl/certs/truenas.pem",
+        "--read-only"
+      ],
+      "env": {
+        "TRUENAS_API_KEY": "REPLACE_WITH_YOUR_TRUENAS_API_KEY"
+      }
     }
   }
 }

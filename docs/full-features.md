@@ -388,3 +388,63 @@ For long-running operations like app upgrades, system updates, and scrubs:
 - **tasks_get** - Get detailed status of a specific task by ID
   - Automatic background polling of TrueNAS job status
   - Tasks update automatically without manual polling
+
+## Snapshot Lifecycle
+
+Snapshots were previously queryable but not manageable, which left out the most
+common recovery workflow: take a snapshot before a risky change, roll back if it
+breaks.
+
+### `create_snapshot`
+Create a snapshot of a dataset or zvol.
+- `dataset` (required) - dataset to snapshot, e.g. `tank/data`
+- `name` (required) - the part after `@`, e.g. `before-upgrade`
+- `recursive` - also snapshot child datasets
+
+The dataset and name are validated before the call, so passing `tank/data@x` as
+the dataset produces a clear error rather than a middleware traceback.
+
+### `delete_snapshot`
+Destroy a snapshot. Supports `dry_run`, which reports the snapshot's current
+size and referenced data before you commit.
+- `snapshot` (required) - full `dataset@snapshot` name
+- `recursive` - also delete identically named child snapshots
+
+### `rollback_snapshot`
+Roll a dataset back to a snapshot. **Destructive**: everything written after
+that snapshot is discarded.
+- `snapshot` (required) - full `dataset@snapshot` name
+- `force` - destroy newer snapshots that block the rollback
+- `dry_run` - list exactly which newer snapshots would be destroyed
+
+`dry_run` is worth using every time here: it queries the newer snapshots and
+names them, so the user can see what `force` would cost before agreeing to it.
+
+### `query_snapshot_tasks`
+List periodic snapshot tasks — which datasets are snapshotted automatically, on
+what schedule, and with what retention. This is how you answer "is this dataset
+actually protected?" rather than assuming it is.
+
+## Infrastructure Visibility
+
+Read-only tools covering the parts of TrueNAS that previously required leaving
+the assistant and opening the web UI. All are safe in `--read-only` mode.
+
+| Tool | Answers |
+| --- | --- |
+| `query_services` | Is SMB/NFS/iSCSI/SSH running, and does it start at boot? |
+| `query_disks` | Model, serial, size and pool membership; which disks are unassigned |
+| `query_users` | Accounts, UIDs, groups, shells, whether an account is locked |
+| `query_groups` | Groups, GIDs, membership |
+| `query_replication_tasks` | Are off-site copies configured, enabled and succeeding? |
+| `query_cloudsync_tasks` | Cloud sync direction, schedule and last run state |
+| `query_certificates` | Common names, SANs, issuers and expiry dates |
+| `query_iscsi_targets` | Block storage exported to hypervisors |
+
+Each accepts a `limit` and a substring filter on the most useful field.
+
+**Secrets are excluded by field selection, not by trusting the middleware.**
+`query_users` never returns password hashes or SSH keys, `query_cloudsync_tasks`
+never returns provider credentials, and `query_certificates` never returns
+private keys or CSRs — the handlers project a fixed allowlist of fields rather
+than forwarding whatever the API happened to include.

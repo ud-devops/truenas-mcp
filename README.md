@@ -9,6 +9,8 @@ A Model Context Protocol (MCP) server for TrueNAS that enables AI models to inte
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Safety](#safety)
+- [Transports](#transports)
 - [Building](#building)
 - [Installation](#installation)
   - [Step 1: Download or Build Binary](#step-1-download-or-build-binary)
@@ -39,13 +41,19 @@ TrueNAS MCP provides comprehensive management capabilities through natural langu
 - 📈 **Capacity Planning** - Utilization analysis and trend projections
 - 🔄 **Maintenance** - System updates, boot environments, pool scrubs
 - 📦 **Applications** - Catalog search, guided installation with storage setup, app management and upgrades
+- 📸 **Snapshots** - Create, delete and roll back snapshots; inspect periodic snapshot tasks
+- 🧰 **Infrastructure** - Services, disks, users, groups, certificates, replication, cloud sync, iSCSI targets
 - ⚙️ **Tasks** - Long-running operation tracking
 
 ### Key Capabilities
 - **Intelligent Filtering & Sorting** - Query datasets, snapshots, VMs with smart filters
 - **Dry-Run Mode** - Preview changes before execution for all write operations
+- **Read-Only Mode** - `--read-only` exposes only the tools that cannot change anything
+- **Tool Annotations** - Every tool declares whether it is read-only, destructive, idempotent
+- **Argument Validation** - Bad or missing arguments fail with a clear message instead of a middleware traceback
 - **Task Tracking** - Automatic progress monitoring for updates, upgrades, and scrubs
-- **Safety Checks** - Built-in validation prevents dangerous operations
+- **Concurrent Dispatch** - A slow tool call no longer blocks the rest of the session
+- **Two Transports** - stdio for local clients, Streamable HTTP for remote ones
 - **Natural Language** - Ask questions in plain English, get actionable insights
 
 📖 **[View complete feature list →](docs/full-features.md)**
@@ -55,33 +63,97 @@ TrueNAS MCP provides comprehensive management capabilities through natural langu
 **Single native binary** that runs on your desktop and connects directly to TrueNAS:
 
 ```
-┌──────────────────┐
-│  Claude Desktop  │
-└────────┬─────────┘
-         │ stdio (JSON-RPC)
-┌────────▼───────────────────┐
-│  truenas-mcp               │ (Your Desktop)
-│  - stdio interface         │
-│  - Tool registry           │
-│  - WebSocket client        │
-└────────┬───────────────────┘
+┌──────────────────┐        ┌──────────────────┐
+│  MCP client      │        │  MCP client      │
+│  (subprocess)    │        │  (remote/IDE)    │
+└────────┬─────────┘        └────────┬─────────┘
+         │ stdio (JSON-RPC)          │ Streamable HTTP
+         │                           │ + bearer token
+┌────────▼───────────────────────────▼─────────┐
+│  truenas-mcp                                 │
+│                                              │
+│  mcp/    protocol: dispatch, negotiation,    │
+│          cancellation, stdio + HTTP          │
+│  tools/  registry: one file per domain,      │
+│          annotations, read-only guard,       │
+│          argument validation                 │
+│  tasks/  long-running job tracking           │
+│  truenas/ multiplexed WebSocket client       │
+└────────┬─────────────────────────────────────┘
          │ Secure WebSocket (wss://)
          │ + TrueNAS API key auth
 ┌────────▼──────────────────┐
 │  TrueNAS Middleware       │
 │  - WebSocket HTTPS endpoint│
-│  - Port 443 (wss)          │
+│  - Port 443 (or your own)  │
 └───────────────────────────┘
 ```
 
+Layering rule: `mcp/` knows nothing about TrueNAS and `truenas/` knows nothing
+about MCP. `tools/` is the only package that joins them, which is what makes
+the protocol layer testable without a NAS and the client testable without a
+model.
+
 **Key Benefits:**
 - ✅ No deployment to TrueNAS required
-- ✅ Runs entirely on your desktop
+- ✅ Runs entirely on your desktop, or as a shared HTTP endpoint
 - ✅ Secure WebSocket connection (wss://) to TrueNAS middleware
 - ✅ Self-signed certificate support via `--tls-ca` (works with TrueNAS defaults)
 - ✅ Cross-platform support (macOS, Linux, Windows)
-- ✅ Simple configuration with hostname or full WebSocket URL
+- ✅ Hostname, `host:port`, IPv6 literal, or full WebSocket URL
 - ✅ API key protection (requires encrypted connections)
+- ✅ `--read-only` mode for pointing a model at production storage safely
+- ✅ Concurrent tool calls: one slow operation does not block the session
+
+## Safety
+
+Every tool carries an MCP annotation describing what it can do — see
+[`tools/annotations.go`](tools/annotations.go), which is the single source of
+truth. A tool missing from that table is treated as destructive.
+
+| Class | Meaning | Examples |
+| --- | --- | --- |
+| read | Cannot change anything | `query_pools`, `system_health`, `query_disks` |
+| write | Additive or easily reversed | `create_dataset`, `create_snapshot`, `start_app` |
+| destructive | Can lose data or interrupt service | `system_reboot`, `delete_snapshot`, `rollback_snapshot`, `apply_update` |
+
+Three controls build on that classification:
+
+```bash
+# See exactly what a configuration exposes (no TrueNAS connection needed)
+./truenas-mcp --list-tools
+./truenas-mcp --read-only --list-tools
+
+# Expose only tools that cannot change the system
+./truenas-mcp --truenas-url truenas.local --read-only
+
+# Or keep write access but rule out specific operations
+./truenas-mcp --truenas-url truenas.local \
+  --deny-tools system_reboot,apply_update,rollback_snapshot
+```
+
+`--read-only` both hides write tools from `tools/list` and refuses them at call
+time, so a model cannot invoke one it remembers from a previous session.
+
+## Transports
+
+**stdio** (default) — the client launches the binary as a subprocess.
+
+**Streamable HTTP** — for clients that cannot spawn a subprocess:
+
+```bash
+./truenas-mcp --truenas-url truenas.local --http-addr 127.0.0.1:8089
+```
+
+The endpoint is `POST /mcp`, with `GET /healthz` for liveness. Two safeguards
+apply automatically:
+
+- Binding to anything other than loopback **requires** `--http-token` (or
+  `TRUENAS_MCP_HTTP_TOKEN`). An unauthenticated MCP endpoint on a routable
+  address is a remote control for the NAS.
+- Browser `Origin` headers are rejected unless they are loopback or listed in
+  `--http-allowed-origins`, which is what stops a random web page from driving
+  a locally bound server via DNS rebinding.
 
 ## Building
 
@@ -262,12 +334,34 @@ You should now be able to ask TrueNAS questions:
 
 ### Flags
 
+**Connection**
+
 - `--truenas-url` - TrueNAS hostname (required, or use `TRUENAS_URL` env var)
-  - Examples: `truenas.local` or `192.168.0.31` (automatically uses `wss://` on port 443)
+  - Accepts `truenas.local`, `192.168.0.31`, `truenas.local:8443`, `[fd00::1]:443`, or a full `wss://host/websocket` URL
+  - A port you specify is honoured; without one, port 443 is used
   - ⚠️ **Note**: `ws://` (unencrypted) is **not allowed** - TrueNAS will revoke API keys used over unencrypted connections
 - `--api-key` - TrueNAS API key for authentication (required, or use `TRUENAS_API_KEY` env var)
 - `--tls-ca` - Path to a PEM certificate to trust, e.g. the TrueNAS self-signed certificate (or use `TRUENAS_TLS_CA` env var)
 - `--insecure` - Disable TLS certificate verification entirely (or set `TRUENAS_INSECURE=1`) - **unsafe**: allows man-in-the-middle attacks; prefer `--tls-ca`
+- `--request-timeout` - Timeout for a single middleware call (default `2m`)
+
+**Tool exposure**
+
+- `--read-only` - Expose only tools that cannot change the system (or set `TRUENAS_MCP_READ_ONLY=1`)
+- `--allow-tools` - Comma-separated allowlist of tool names (or `TRUENAS_MCP_ALLOW_TOOLS`)
+- `--deny-tools` - Comma-separated denylist of tool names (or `TRUENAS_MCP_DENY_TOOLS`)
+- `--list-tools` - Print the tools this configuration exposes, with their safety class, and exit. Works without a TrueNAS connection.
+
+**Transport**
+
+- `--http-addr` - Serve Streamable HTTP on this address instead of stdio, e.g. `127.0.0.1:8089` (or `TRUENAS_MCP_HTTP_ADDR`)
+- `--http-path` - HTTP path for the MCP endpoint (default `/mcp`)
+- `--http-token` - Bearer token required by the HTTP transport (or `TRUENAS_MCP_HTTP_TOKEN`). Mandatory for non-loopback binds.
+- `--http-allowed-origins` - Comma-separated browser Origins allowed to call the HTTP endpoint
+- `--max-concurrent` - Maximum tool calls executed at once (default 8, `-1` for unlimited)
+
+**Other**
+
 - `--debug` - Enable debug logging (or set `TRUENAS_MCP_DEBUG=1`)
 - `--version` - Print version and exit
 

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -10,7 +11,7 @@ import (
 )
 
 // handleCreateDataset creates a new ZFS dataset (filesystem or volume)
-func handleCreateDataset(client *truenas.Client, args map[string]interface{}) (string, error) {
+func handleCreateDataset(ctx context.Context, client *truenas.Client, args map[string]interface{}) (string, error) {
 	// Extract required parameters
 	name, ok := args["name"].(string)
 	if !ok || name == "" {
@@ -140,7 +141,7 @@ func handleCreateDataset(client *truenas.Client, args map[string]interface{}) (s
 	}
 
 	// Call the API (error will include payload automatically)
-	result, err := client.Call("pool.dataset.create", payload)
+	result, err := client.CallContext(ctx, "pool.dataset.create", payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to create dataset: %w", err)
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 // handleCreateSMBShare creates a new SMB share
-func handleCreateSMBShare(client *truenas.Client, args map[string]interface{}) (string, error) {
+func handleCreateSMBShare(ctx context.Context, client *truenas.Client, args map[string]interface{}) (string, error) {
 	// Extract required parameters
 	name, ok := args["name"].(string)
 	if !ok || name == "" {
@@ -134,7 +134,7 @@ func handleCreateSMBShare(client *truenas.Client, args map[string]interface{}) (
 	}
 
 	// Call the API
-	result, err := client.Call("sharing.smb.create", payload)
+	result, err := client.CallContext(ctx, "sharing.smb.create", payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to create SMB share: %w", err)
 	}

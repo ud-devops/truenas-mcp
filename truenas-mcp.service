@@ -1,25 +1,44 @@
 [Unit]
-Description=TrueNAS MCP Server
+Description=TrueNAS MCP Server (Streamable HTTP transport)
 Documentation=https://github.com/truenas/truenas-mcp
-After=network.target middlewared.service
-Wants=middlewared.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/truenas-mcp -listen 0.0.0.0:8080
+# Bind to loopback unless you also set a bearer token: an unauthenticated MCP
+# endpoint on a routable address is a remote control for the NAS.
+ExecStart=/usr/local/bin/truenas-mcp \
+    --http-addr 127.0.0.1:8089 \
+    --truenas-url truenas.local \
+    --tls-ca /etc/ssl/certs/truenas.pem \
+    --read-only
 Restart=on-failure
 RestartSec=5s
 
-# Environment
-Environment="TRUENAS_SOCKET=/var/run/middleware/middleware.sock"
-Environment="TRUENAS_MCP_API_KEY=change-me-to-secure-key"
+# Credentials. Prefer an EnvironmentFile with mode 0600 over inline values so
+# the API key does not appear in `systemctl show`.
+EnvironmentFile=/etc/truenas-mcp.env
+# The file should contain:
+#   TRUENAS_API_KEY=...
+#   TRUENAS_MCP_HTTP_TOKEN=...
 
-# Security settings
-# Note: May need to adjust User/Group if middleware socket requires specific permissions
-# User=nobody
-# Group=nogroup
+# Hardening
+User=truenas-mcp
+Group=truenas-mcp
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 
 # Logging
 StandardOutput=journal

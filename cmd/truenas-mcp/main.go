@@ -1,14 +1,16 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/truenas/truenas-mcp/mcp"
@@ -18,287 +20,240 @@ import (
 )
 
 var (
-	truenasURL = flag.String("truenas-url", "", "TrueNAS hostname or WebSocket URL (e.g., 'truenas.local' or 'ws://10.0.0.1/websocket')")
+	truenasURL = flag.String("truenas-url", "", "TrueNAS hostname or WebSocket URL (e.g., 'truenas.local', 'truenas.local:8443' or 'wss://10.0.0.1/websocket')")
 	apiKey     = flag.String("api-key", "", "TrueNAS API key for middleware authentication")
 	insecure   = flag.Bool("insecure", false, "Disable TLS certificate verification (UNSAFE: allows man-in-the-middle attacks)")
 	tlsCA      = flag.String("tls-ca", "", "Path to a PEM certificate to trust (e.g., the TrueNAS self-signed certificate)")
 	versionFlg = flag.Bool("version", false, "Print version and exit")
 	debug      = flag.Bool("debug", false, "Enable debug logging")
+
+	readOnly   = flag.Bool("read-only", false, "Expose only tools that cannot change the system")
+	allowTools = flag.String("allow-tools", "", "Comma-separated allowlist of tool names (default: all)")
+	denyTools  = flag.String("deny-tools", "", "Comma-separated denylist of tool names")
+	listTools  = flag.Bool("list-tools", false, "Print the tools this configuration exposes and exit")
+
+	requestTimeout = flag.Duration("request-timeout", truenas.DefaultRequestTimeout, "Timeout for a single TrueNAS middleware call")
+	maxConcurrent  = flag.Int("max-concurrent", mcp.DefaultMaxConcurrentCalls, "Maximum tool calls executed at once (-1 for unlimited)")
+
+	httpAddr    = flag.String("http-addr", "", "Serve MCP over Streamable HTTP on this address instead of stdio (e.g., 127.0.0.1:8089)")
+	httpPath    = flag.String("http-path", "/mcp", "HTTP path for the MCP endpoint")
+	httpToken   = flag.String("http-token", "", "Bearer token required by the HTTP transport (env: TRUENAS_MCP_HTTP_TOKEN). Required for non-loopback binds")
+	httpOrigins = flag.String("http-allowed-origins", "", "Comma-separated browser Origins allowed to call the HTTP endpoint")
 )
 
 // Version is the release version, injected at build time via
 // -ldflags "-X main.Version=...". Builds without injection report "dev".
 var Version = "dev"
 
+const serverInstructions = `This server manages a TrueNAS system over its middleware API.
+Prefer the query_* and get_* tools to understand the system before changing it.
+Tools that change state are annotated; those annotated destructive can interrupt
+service or lose data, so confirm with the user before calling them.`
+
 func main() {
 	flag.Parse()
 
 	if *versionFlg {
 		fmt.Printf("truenas-mcp version %s\n", Version)
-		os.Exit(0)
+		return
 	}
 
-	// Get configuration from flags or environment variables
-	if *truenasURL == "" {
-		*truenasURL = os.Getenv("TRUENAS_URL")
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
-	if *apiKey == "" {
-		*apiKey = os.Getenv("TRUENAS_API_KEY")
+}
+
+func run() error {
+	applyEnvDefaults()
+
+	if *listTools {
+		// Listing the exposed surface must not require a reachable NAS: it is
+		// how someone checks what --read-only or --deny-tools actually does.
+		registry := tools.NewRegistryWithOptions(nil, nil, registryOptions())
+		for _, t := range registry.ListTools() {
+			mode := "write"
+			if t.IsReadOnly() {
+				mode = "read"
+			} else if t.Annotations != nil && t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint {
+				mode = "destructive"
+			}
+			fmt.Printf("%-12s %s\n", mode, t.Name)
+		}
+		return nil
 	}
 
 	if *truenasURL == "" || *apiKey == "" {
-		log.Fatal("Both --truenas-url and --api-key are required (or set TRUENAS_URL and TRUENAS_API_KEY env vars)")
+		return errors.New("both --truenas-url and --api-key are required (or set TRUENAS_URL and TRUENAS_API_KEY env vars)")
 	}
 
-	// TRUENAS_MCP_DEBUG=1 is equivalent to --debug; either enables verbose
-	// (credential-redacted) request/response logging everywhere
-	if truenas.DebugLogging() {
-		*debug = true
-	}
 	truenas.SetDebugLogging(*debug)
-
-	if *tlsCA == "" {
-		*tlsCA = os.Getenv("TRUENAS_TLS_CA")
-	}
-	if !*insecure {
-		switch strings.ToLower(os.Getenv("TRUENAS_INSECURE")) {
-		case "", "0", "false", "no", "off":
-		default:
-			*insecure = true
-		}
-	}
 
 	// Configure TLS: certificates are verified by default. TrueNAS ships a
 	// self-signed certificate, so users must either trust it via --tls-ca
 	// or explicitly opt out of verification with --insecure.
 	tlsConfig, err := truenas.NewTLSConfig(*insecure, *tlsCA)
 	if err != nil {
-		log.Fatalf("Failed to configure TLS: %v", err)
+		return fmt.Errorf("failed to configure TLS: %w", err)
 	}
 	if *insecure {
 		log.Println("WARNING: TLS certificate verification disabled - the connection is vulnerable to man-in-the-middle attacks; prefer --tls-ca with the server's certificate")
 	}
 
-	// Create TrueNAS client
 	client, err := truenas.NewClient(*truenasURL, *apiKey, tlsConfig)
 	if err != nil {
-		log.Fatalf("Failed to create TrueNAS client: %v", err)
+		return fmt.Errorf("failed to create TrueNAS client: %w", err)
 	}
 	defer client.Close()
+	client.SetRequestTimeout(*requestTimeout)
 
-	// Authenticate with TrueNAS middleware
 	if err := client.Authenticate(); err != nil {
-		log.Fatalf("Failed to authenticate with TrueNAS: %v", err)
+		return fmt.Errorf("failed to authenticate with TrueNAS: %w", err)
 	}
 	log.Println("Successfully authenticated with TrueNAS middleware")
 
-	// Create task manager
-	taskConfig := tasks.PollerConfig{
+	taskManager := tasks.NewManager(client, tasks.PollerConfig{
 		PollInterval:    5 * time.Second,
 		MaxPollAttempts: 0, // Unlimited
 		CleanupInterval: 1 * time.Minute,
-	}
-	taskManager := tasks.NewManager(client, taskConfig)
+	})
 	taskManager.Start()
 	defer taskManager.Shutdown()
 
-	// Create tool registry
-	registry := tools.NewRegistry(client, taskManager)
+	registry := tools.NewRegistryWithOptions(client, taskManager, registryOptions())
+	if *readOnly {
+		log.Printf("Read-only mode: exposing %d of %d tools", len(registry.ToolNames()), totalToolCount())
+	}
 
-	// Start stdio handler
-	handler := NewStdioHandler(registry, *debug)
-	if err := handler.Run(); err != nil {
-		log.Fatalf("Stdio handler error: %v", err)
+	server := mcp.NewServer(registry, mcp.ServerOptions{
+		Name:               "truenas-mcp",
+		Version:            Version,
+		Instructions:       serverInstructions,
+		MaxConcurrentCalls: *maxConcurrent,
+		Debug:              *debug,
+	})
+
+	// Shut down cleanly on Ctrl-C or SIGTERM so the WebSocket is closed and
+	// in-flight tool calls are cancelled rather than abandoned.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if *httpAddr != "" {
+		return serveHTTP(ctx, server)
+	}
+
+	log.Println("Serving MCP over stdio")
+	return server.Serve(ctx, mcp.NewStdioTransport())
+}
+
+func serveHTTP(ctx context.Context, server *mcp.Server) error {
+	token := *httpToken
+	if token == "" {
+		token = os.Getenv("TRUENAS_MCP_HTTP_TOKEN")
+	}
+	if token == "" && !mcp.IsLoopback(*httpAddr) {
+		// Binding to a LAN address without auth would hand anyone on the
+		// network a remote control for the NAS.
+		return fmt.Errorf("--http-addr %s is not loopback: set --http-token (or TRUENAS_MCP_HTTP_TOKEN) to require authentication", *httpAddr)
+	}
+	if token == "" {
+		log.Println("WARNING: HTTP transport running without a bearer token (loopback only)")
+	}
+
+	handler := mcp.NewHTTPHandler(server, mcp.HTTPOptions{
+		Addr:           *httpAddr,
+		Path:           *httpPath,
+		BearerToken:    token,
+		AllowedOrigins: splitList(*httpOrigins),
+	})
+
+	httpServer := &http.Server{
+		Addr:              *httpAddr,
+		Handler:           handler.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("Serving MCP over HTTP on http://%s%s", *httpAddr, *httpPath)
+		errCh <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
 	}
 }
 
-// StdioHandler manages stdio communication for MCP protocol
-type StdioHandler struct {
-	registry    mcp.ToolRegistry
-	stdin       *bufio.Scanner
-	stdoutMutex sync.Mutex
-	debug       bool
-}
-
-func NewStdioHandler(registry mcp.ToolRegistry, debug bool) *StdioHandler {
-	return &StdioHandler{
-		registry: registry,
-		stdin:    bufio.NewScanner(os.Stdin),
-		debug:    debug,
+func registryOptions() tools.Options {
+	return tools.Options{
+		ReadOnly: *readOnly,
+		Allow:    splitList(*allowTools),
+		Deny:     splitList(*denyTools),
 	}
 }
 
-func (h *StdioHandler) Run() error {
-	if h.debug {
-		log.Println("Starting stdio handler...")
-	}
-
-	for h.stdin.Scan() {
-		line := h.stdin.Bytes()
-		if h.debug {
-			log.Printf("[STDIN] %s", truenas.RedactJSONForLog(line))
-		}
-
-		var req mcp.Request
-		if err := json.Unmarshal(line, &req); err != nil {
-			if h.debug {
-				log.Printf("Parse error: %v", err)
-			}
-			h.sendError(nil, -32700, fmt.Sprintf("Parse error: %v", err))
-			continue
-		}
-
-		if h.debug {
-			log.Printf("Handling method: %s (id: %v)", req.Method, req.ID)
-		}
-
-		resp := h.handleRequest(&req)
-		// Only send response if not nil (notifications don't get responses)
-		if resp != nil {
-			if err := h.sendResponse(resp); err != nil {
-				log.Printf("Failed to send response: %v", err)
-			}
-		}
-	}
-
-	if err := h.stdin.Err(); err != nil {
-		return fmt.Errorf("stdin error: %w", err)
-	}
-
-	return nil
+func totalToolCount() int {
+	return len(tools.NewRegistryWithOptions(nil, nil, tools.Options{}).ToolNames())
 }
 
-func (h *StdioHandler) handleRequest(req *mcp.Request) *mcp.Response {
-	switch req.Method {
-	case "initialize":
-		return h.handleInitialize(req)
-	case "notifications/initialized":
-		// This is a notification from the client after initialization
-		// Notifications don't require a response
-		return nil
-	case "tools/list":
-		return h.handleToolsList(req)
-	case "tools/call":
-		return h.handleToolsCall(req)
+// applyEnvDefaults fills unset flags from the environment. Flags win: an
+// explicit command line should never be overridden by a stale env var.
+func applyEnvDefaults() {
+	if *truenasURL == "" {
+		*truenasURL = os.Getenv("TRUENAS_URL")
+	}
+	if *apiKey == "" {
+		*apiKey = os.Getenv("TRUENAS_API_KEY")
+	}
+	if *tlsCA == "" {
+		*tlsCA = os.Getenv("TRUENAS_TLS_CA")
+	}
+	if !*debug && truenas.DebugLogging() {
+		*debug = true
+	}
+	if !*insecure && envBool("TRUENAS_INSECURE") {
+		*insecure = true
+	}
+	if !*readOnly && envBool("TRUENAS_MCP_READ_ONLY") {
+		*readOnly = true
+	}
+	if *allowTools == "" {
+		*allowTools = os.Getenv("TRUENAS_MCP_ALLOW_TOOLS")
+	}
+	if *denyTools == "" {
+		*denyTools = os.Getenv("TRUENAS_MCP_DENY_TOOLS")
+	}
+	if *httpAddr == "" {
+		*httpAddr = os.Getenv("TRUENAS_MCP_HTTP_ADDR")
+	}
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "", "0", "false", "no", "off":
+		return false
 	default:
-		// Only return error if this is a request (has an ID)
-		if req.ID != nil {
-			return h.createErrorResponse(req.ID, -32601, "Method not found")
-		}
-		// For notifications, no response needed
+		return true
+	}
+}
+
+func splitList(s string) []string {
+	if strings.TrimSpace(s) == "" {
 		return nil
 	}
-}
-
-func (h *StdioHandler) handleInitialize(req *mcp.Request) *mcp.Response {
-	result := mcp.InitializeResult{
-		ProtocolVersion: "2024-11-05",
-		ServerInfo: mcp.ServerInfo{
-			Name:    "truenas-mcp",
-			Version: Version,
-		},
-		Capabilities: mcp.Capabilities{
-			Tools: map[string]interface{}{
-				"listChanged": false,
-			},
-		},
-	}
-
-	return &mcp.Response{
-		JSONRPC: "2.0",
-		ID:      req.ID,
-		Result:  result,
-	}
-}
-
-func (h *StdioHandler) handleToolsList(req *mcp.Request) *mcp.Response {
-	tools := h.registry.ListTools()
-	result := mcp.ToolsListResult{
-		Tools: tools,
-	}
-
-	return &mcp.Response{
-		JSONRPC: "2.0",
-		ID:      req.ID,
-		Result:  result,
-	}
-}
-
-func (h *StdioHandler) handleToolsCall(req *mcp.Request) *mcp.Response {
-	// Extract tool call parameters
-	var params mcp.ToolCallParams
-	paramsBytes, err := json.Marshal(req.Params)
-	if err != nil {
-		return h.createErrorResponse(req.ID, -32602, fmt.Sprintf("Invalid params: %v", err))
-	}
-
-	if err := json.Unmarshal(paramsBytes, &params); err != nil {
-		return h.createErrorResponse(req.ID, -32602, fmt.Sprintf("Invalid params: %v", err))
-	}
-
-	// Call the tool
-	result, err := h.registry.CallTool(params.Name, params.Arguments)
-	if err != nil {
-		return &mcp.Response{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: mcp.ToolCallResult{
-				Content: []mcp.ContentBlock{
-					{
-						Type: "text",
-						Text: fmt.Sprintf("Error: %v", err),
-					},
-				},
-				IsError: true,
-			},
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
 	}
-
-	return &mcp.Response{
-		JSONRPC: "2.0",
-		ID:      req.ID,
-		Result: mcp.ToolCallResult{
-			Content: []mcp.ContentBlock{
-				{
-					Type: "text",
-					Text: result,
-				},
-			},
-		},
-	}
-}
-
-func (h *StdioHandler) createErrorResponse(id interface{}, code int, message string) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &mcp.Error{
-			Code:    code,
-			Message: message,
-		},
-	}
-}
-
-func (h *StdioHandler) sendResponse(resp *mcp.Response) error {
-	h.stdoutMutex.Lock()
-	defer h.stdoutMutex.Unlock()
-
-	data, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("failed to marshal response: %w", err)
-	}
-
-	if h.debug {
-		log.Printf("[STDOUT] %s", truenas.RedactJSONForLog(data))
-	}
-
-	fmt.Printf("%s\n", data)
-	return nil
-}
-
-func (h *StdioHandler) sendError(id interface{}, code int, message string) {
-	resp := h.createErrorResponse(id, code, message)
-	if err := h.sendResponse(resp); err != nil {
-		log.Printf("Failed to send error response: %v", err)
-	}
+	return out
 }
